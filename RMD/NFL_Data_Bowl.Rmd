@@ -1,0 +1,868 @@
+---
+title: "NFL Big Data Bowl 2022"
+author: "Donald Dinerman"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+```
+
+```{r, include=F}
+#Reference: https://www.kaggle.com/c/nfl-big-data-bowl-2022/data
+#Deadline: January 6, 2022
+```
+
+## Overview
+
+This project is part of an annual sports analytics contest from NFL Football Operations challenging members of the analytics community to contribute to the NFL’s continuing evolution of the use of advanced analytics.
+
+The theme of the 2021-22 Big Data Bowl is to devise innovative approaches to analyzing special teams in the NFL.
+
+Our challenge is to generate actionable, practical, and novel insights from player tracking data that correspond to special teams plays (e.g., punt, kickoff, field goal/extra point). 
+
+Specifically, we will focus on designing a new special teams metric to rank players for punts, field goals, and kickoffs. We've designed a standardized and weighted model that allows us to see how punters and kickers stack up against their respective position groups each season.
+
+Leveraging my experience as a collegiate punter at Carnegie Mellon University, I will lend novel insights into designing our ranking model by identifying both implicit and explicit factors characterizing the top special teams players.
+
+## Load Data
+
+```{r, include=F}
+#load libraries
+library(tidyr)
+library(caTools) #sample.split()
+library(dplyr)
+library(ggplot2)
+library(gridExtra) #grid.arrange()
+library(forcats)
+library(data.table) #as.ITime()
+library(plotly)
+library(hms) #parse_hms()
+library(tibbletime)
+library(stringr)
+library(Hmisc) #binconf()
+library(kableExtra) #kable()
+```
+
+```{r}
+#Read Data
+games_df = read.csv("games.csv")
+players_df = read.csv("players.csv")
+plays_df = read.csv("plays.csv")
+scouting_df = read.csv("PFFScoutingData.csv")
+```
+
+```{r, include=F}
+#Preview
+head(games_df)
+head(players_df)
+head(plays_df)
+head(scouting_df)
+```
+
+## Clean and Prep Data
+
+```{r}
+#Merge Data frames
+#based on nflID from players_df (include displayName, Position, height, weight) with kickerid from plays_df
+#inner outer left right join
+#use select and piping to get specific columns to merge
+
+m1 = merge(x = players_df %>% dplyr::select(nflId, displayName, Position),
+      y = plays_df %>% dplyr::select(-c(returnerId,kickBlockerId,penaltyCodes,penaltyJerseyNumbers,passResult)),
+      by.x = "nflId", 
+      by.y = "kickerId")
+
+#merge with games_df to get year and week: by gameId, season(year), week
+
+m2 = merge(x = games_df %>% dplyr::select(gameId, season, week),
+           y = m1,
+           by.x = "gameId",
+           by.y = "gameId")
+
+#based on gameID & playID from scouting_df
+
+m3 = merge(x = m2,
+           y = scouting_df %>% 
+             dplyr::select(-c(missedTackler,assistTackler,tackler,kickoffReturnFormation,gunners,puntRushers,specialTeamsSafeties,vises)),
+           by = c("gameId", "playId")) %>%
+  mutate(handlingTime = operationTime - snapTime, #add punter handling time
+         .after = operationTime) %>%
+  filter(Position == "K" | Position == "P")
+```
+
+```{r}
+#Apply Interpretable Labels to factors
+#Can do this using nested ifelse statements or case_when
+#Change kick type
+temp = m3$kickType
+
+m3$kickType_mod = ifelse(temp == "D", "Deep",
+                       ifelse(temp == "F", "Flat",
+                       ifelse(temp == "K", "Free Kick",
+                       ifelse(temp == "O", "Obvious Onside",
+                       ifelse(temp == "P", "Pooch Kick",
+                       ifelse(temp == "Q", "Squib",
+                       ifelse(temp == "S", "Suprise Onside",
+                       ifelse(temp == "B", "OOB Directly",
+                       ifelse(temp == "N", "Normal",
+                       ifelse(temp == "R", "Rugby",
+                       ifelse(temp == "A", "Nose Down", NA)))))))))))
+
+#Change special teams result
+
+temp = m3$specialTeamsResult
+hold = unique(temp)
+
+m3$specialTeamsResult_mod = case_when(temp == hold[1] ~ "Made",
+                                    temp == hold[7] ~ "Missed",
+                                    temp == hold[9] ~ "Blocked Kick",
+                                    temp == hold[10] ~ "Blocked Punt",
+                                    temp == hold[11] ~ "Recovery",
+                                    TRUE ~ temp)
+```
+
+```{r}
+#Create game clock data that can be interpreted in ggplot and other analysis
+#add time variable
+m3$gameClock_time = gsub(".{3}$", "", m3$gameClock) %>% #Removes last three digits from string
+  gsub("^", "00:",.) %>% #Adds "00:" to the front
+  parse_hms() %>% #Assign hms class
+  as.POSIXct() #Assign POSIXct class
+
+#Add clutch dummy variable: 
+#1 possession game (within 8 points), last 5 minutes of game (quarter == 4 | quarter == 5 & gameClock_time <= as_hms("00:05:00")
+
+m3 = m3 %>% mutate(score_diff = abs(preSnapHomeScore - preSnapVisitorScore)) #calc score difference
+
+m3$time_clutch = ifelse(m3$score_diff <= 3 & m3$quarter == 4 & as_hms(m3$gameClock_time) < as_hms("00:05:00") |
+                               m3$score_diff <= 3 & m3$quarter == 5 & as_hms(m3$gameClock_time) < as_hms("00:05:00"), 1, 0)
+```
+
+```{r}
+#Based on EDA from punt snap detail and kick distance/hang need to apply dummy var for future weights on specific snap detail
+#Add dummy var for punt snap detail
+
+temp = m3$snapDetail
+temp_playtype = m3$specialTeamsPlay
+m3$snapDetail_mod = ifelse(temp_playtype == "Punt" & temp == ">", 1, 0)
+
+#Net yards for punts and kicks is captured by the play result variable (note that it includes penalty yards)
+```
+
+```{r}
+#Apply correct classes
+#change var class (i.e., quarter should be factor not numeric and kickType should be factor not char)
+
+m3 = transform(m3,
+          season = as.factor(season),
+          week = as.factor(week),
+          kickType_mod = as.factor(kickType_mod),
+          specialTeamsResult_mod = as.factor(specialTeamsResult_mod),
+          time_clutch = as.factor(time_clutch),
+          snapDetail_mod = as.factor(snapDetail_mod)
+          )
+```
+
+```{r}
+#Issue: there are punters that do kickoffs and punts and vice versa
+#Solution: Need to filter by specialTeamsPlayType rather than position
+
+#Make seperate data sets for by play type because kickoffs, xp, fg, punt evaluated differently
+
+#Kickoff
+m3_kickoff = m3 %>%
+  filter(specialTeamsPlayType == "Kickoff")
+
+#table(m3_kickoff$kickType_mod) #filter out OOB Directly (only 1 obs)
+
+m3_kickoff = filter(m3_kickoff, kickType_mod !=  "OOB Directly")
+
+#out of bounds kickoffs
+m3_kickoff$oob = ifelse(m3_kickoff$specialTeamsResult_mod == "Out of Bounds", 1, 0)
+
+#Extra Point
+m3_xp = m3 %>%
+  filter(specialTeamsPlayType == "Extra Point")
+
+m3_xp$good = ifelse(m3_xp$specialTeamsResult == "Kick Attempt Good", 1, 0) #made xp
+
+#table(m3_xp$specialTeamsResult) #filter out trick xp: None
+
+#Field Goal
+m3_fg = m3 %>%
+  filter(specialTeamsPlayType == "Field Goal")
+
+#table(m3_fg$kickType_mod) #filter out trick punts
+
+m3_fg = m3_fg[is.na(m3_fg$kickType_mod),] #only keep NAs which means taking out nose down
+
+#Punt
+m3_punt = m3 %>%
+  filter(specialTeamsPlayType == "Punt")
+
+#table(m3_punt$kickType_mod) #Only keep type A and N punts
+
+#kickType_mod listed as NA for blocked punts
+
+m3_punt$kickType_mod = fct_explicit_na(m3_punt$kickType_mod, "Unknown")
+
+m3_punt_main = filter(m3_punt, kickType_mod == "Normal" | kickType_mod == "Nose Down" | kickType_mod == "Unknown")
+```
+
+```{r}
+#Apply distance buckets for field goal kickers
+
+m3_fg$good_less30 = ifelse(m3_fg$specialTeamsResult_mod == "Made" & m3_fg$kickLength < 30, 1, 
+                           ifelse(m3_fg$kickLength < 30, -1, 0))
+
+m3_fg$good_30to40 = ifelse(m3_fg$specialTeamsResult_mod == "Made" & m3_fg$kickLength >= 30 & m3_fg$kickLength < 40, 1,
+                           ifelse(m3_fg$kickLength >= 30 & m3_fg$kickLength < 40, -1, 0))
+
+m3_fg$good_40to50 = ifelse(m3_fg$specialTeamsResult_mod == "Made" & m3_fg$kickLength >= 40 & m3_fg$kickLength < 50, 1,
+                           ifelse(m3_fg$kickLength >= 40 & m3_fg$kickLength < 50, -1, 0))
+
+m3_fg$good_above50 = ifelse(m3_fg$specialTeamsResult_mod == "Made" & m3_fg$kickLength >= 50, 1,
+                            ifelse(m3_fg$kickLength >= 50, -1, 0))
+```
+
+```{r}
+#made/missed clutch kicks
+good_df = m3_fg[,42:45] #df of fg brackets
+
+good_df[good_df==0] = 1 #convert zeros to ones for when we do multiplication (doesn't impact missed clutch [-1])
+
+test_df = cbind(as.integer(as.character(m3_fg$time_clutch)), good_df) #place clutch var with new fg dist brackets
+
+m3_fg$good_clutch = apply(test_df, 1, prod) #multiply across rows
+
+#made/missed non clutch kicks
+m3_fg$good_no_clutch = ifelse(m3_fg$specialTeamsResult_mod == "Made" & m3_fg$time_clutch == 0, 1,
+       ifelse(m3_fg$specialTeamsResult_mod == "Missed" & m3_fg$time_clutch == 0, -1, 0))
+```
+
+```{r}
+#Clutch df by distance
+clutch_dist_func = function(vec){
+  
+  #vectors separating clutch vs non-clutch kicks (*vec is flexible and denotes fg distance)
+  v1 = ifelse(vec == 1 & m3_fg$time_clutch == 0, 1,
+       ifelse(vec == -1 & m3_fg$time_clutch == 0, -1, 0))
+
+  v2 = ifelse(vec == 1 & m3_fg$time_clutch == 1, 1,
+       ifelse(vec == -1 & m3_fg$time_clutch == 1, -1, 0))
+  
+  #sample size
+  n_nc = sum(v1 == -1, na.rm = T) + sum(v1 == 1, na.rm = T)
+  
+  n_c = sum(v2 == -1, na.rm = T) + sum(v2 == 1, na.rm = T)
+   
+  #made kicks
+  x_nc = sum(v1 == 1, na.rm = T)
+  
+  x_c = sum(v2 == 1, na.rm = T)
+  
+  #Binomial Confidence Intervals (point estimate is proportion, lower and upper are CI bounds)
+  ci_nc = binconf(x = x_nc, n = n_nc)
+  
+  ci_c = binconf(x = x_c, n = n_c)
+  
+  #Call variables
+  prop_nc = ci_nc[1]; lower_nc = ci_nc[2]; upper_nc = ci_nc[3]
+  
+  prop_c = ci_c[1]; lower_c = ci_c[2]; upper_c = ci_c[3]
+  
+  #Output
+  c(prop_c, prop_nc, lower_c, lower_nc, upper_c, upper_nc)
+}
+
+stat_30 = clutch_dist_func(m3_fg$good_less30)
+
+stat_30_40 = clutch_dist_func(m3_fg$good_30to40)
+
+stat_40_50 = clutch_dist_func(m3_fg$good_40to50)
+
+stat_50 = clutch_dist_func(m3_fg$good_above50)
+
+#create tall df
+kick_dist = c(rep("20-29", 2), rep("30-39", 2), rep("40-49", 2), rep(">50", 2))
+
+prop = c(stat_30[1:2], stat_30_40[1:2], stat_40_50[1:2], stat_50[1:2])
+
+lower = c(stat_30[3:4], stat_30_40[3:4], stat_40_50[3:4], stat_50[3:4])
+
+upper = c(stat_30[5:6], stat_30_40[5:6], stat_40_50[5:6], stat_50[5:6])
+
+clutchness = rep(c("Yes", "No"),4)
+
+clutch_fg_df = data.frame(kick_dist, prop, lower, upper, clutchness)
+```
+
+
+```{r}
+#including inside the inside the 20 yd line statistic
+
+x = m3_punt$yardlineNumber
+y = m3_punt$playResult
+
+m3_punt$fin_yardline = x+y
+
+m3_punt$inside_20 = ifelse(m3_punt$fin_yardline > 80, 1, 0)
+```
+
+```{r, results=F}
+#NFL Operation Time: 1.9-2.1 seconds
+#Handling Time threshold is 1st quarter of handling time distribution (75% percentile)
+
+m3_punt$handlingTime %>% summary(na.rm=T)
+
+m3_punt$block = ifelse(m3_punt$specialTeamsResult_mod == "Blocked Punt" & m3_punt$handlingTime > 1.21, 1, 0)
+```
+
+## Exploratory Data Analysis
+
+```{r,include=F}
+#top 10 most common colleges
+
+players_df$collegeName = gsub("amp;","",players_df$collegeName) #fix "&" typo in df
+
+players_df %>%
+  filter(Position == "K"|Position == "P"|Position == "LS") %>% #kicker, punter, long snapper
+  group_by(collegeName) %>%
+  summarise(count = n()) %>% 
+  arrange(-count) %>%
+  mutate(collegeName = factor(collegeName, collegeName)) %>% #set factor order
+  head(5) %>%
+  ggplot(aes(x = collegeName, y = count)) +
+  geom_bar(stat = "identity", col = "black", fill = "steelblue") +
+  scale_x_discrete(limits = rev) + #reverse x label order
+  coord_flip() +
+  labs(title = "Top 5 Special Teams Universities", x = "University", y = "NFL Special Teams Players")
+```
+
+```{r,include=F}
+#Special Teams Plays
+positions = m3 %>%
+  group_by(specialTeamsPlayType) %>%
+  summarise(count = n()) %>%
+  arrange(count) %>%
+  pull(1)
+
+ggplot(m3, aes(specialTeamsPlayType, ..count..)) +
+  geom_bar(fill  = "steelblue", col = "Black") +
+  scale_x_discrete(limits = positions) +
+  coord_flip() +
+  labs(title = "Special Team Plays", y = "Frequency", x = "")
+```
+
+### Kickoffs
+
+```{r, fig.cap = "Figure 1: A bar chart of kickoff results. A majority of kickoffs result in touchbacks."}
+positions = m3_kickoff %>%
+  group_by(specialTeamsResult_mod) %>%
+  summarise(count = n()) %>%
+  arrange(count) %>%
+  pull(1)
+
+ggplot(m3_kickoff) +
+  geom_bar(aes(x = specialTeamsResult_mod, ..count..), col = "Black", fill = "steelblue") +
+  scale_x_discrete(limits = positions) +
+  coord_flip() +
+  labs(title = "Kickoff Results", y = "Frequency", x = "")
+```
+
+Even though most, if not all, NFL kickers and punters have the leg strength to kick touchbacks (i.e., kickoffs into the end zone that are placed on the receiving team's 25yd line) it appears that there is a significant share of kickoff results are returns. This may indicate that a kickoff strategy for kickoff units is to intentionally kick returnable balls in an attempt to down the ball within the 25yd line. Since kicking teams prioritize downing the ball within the 25yd line, we will evaluate net yards (i.e., kicking yards minus return yards) for kickoffs in our model.
+
+```{r, warning=F, fig.cap = "Figure 2: Boxplot of kickoff return distance by team."}
+#Boxplot of return yardage grouped by receiving team (possession team)
+
+positions = m3_kickoff %>%
+  group_by(possessionTeam) %>%
+  summarise(med_return = median(kickReturnYardage, na.rm = T)) %>%
+  arrange(med_return) %>%
+  pull(1)
+
+#positions = sort(positions, decreasing = T) #alphabetical order
+
+ggplot(m3_kickoff) +
+  geom_boxplot(aes(x = kickReturnYardage, y = possessionTeam)) +
+  scale_y_discrete(limits = positions) +
+  scale_x_continuous(breaks = seq(-20,100,20)) +
+  labs(title = "Kickoff Return by Team", x = "Return Distance (Yards)", y = "")
+```
+
+This is more of an interesting fact pulled from the data, illustrating kickoff return performance by teams. Note that return distance is not equivalent to yard line because a kickoff can be fielded from a place other than the goal line. Negative return distances are the result of penalties from the receiving team.
+
+```{r, include=F}
+#Kickoff types
+
+positions = m3_kickoff %>%
+  group_by(kickType_mod) %>%
+  summarise(count = n()) %>%
+  arrange(count) %>%
+  pull(1)
+
+ggplot(m3_kickoff) +
+  geom_bar(aes(x = kickType_mod, ..count..), col = "Black", fill = "steelblue") +
+  scale_x_discrete(limits = positions) +
+  coord_flip() +
+  labs(title = "Kickoff Types", y = "Frequency", x = "")
+```
+
+```{r, warning=F, include=F}
+#kickoff return yard distribution
+
+ggplot(m3_kickoff, aes(kickReturnYardage)) +
+  geom_density(col = "steelblue", fill = "steelblue", alpha = 0.2) +
+  labs(title = "Distribution of Kickoff Return Distance", x = "Return Distance (Yards)", y = "Density")
+```
+
+```{r, warning=F, fig.cap = "Figure 3: Boxplot of kickoff return distance by team."}
+#kick direction and return yards
+
+#Add accuracy Variable
+m3_kickoff$kickoff_accuracy = case_when(m3_kickoff$kickDirectionIntended ==  m3_kickoff$kickDirectionActual ~ "Accurate",
+              m3_kickoff$kickDirectionIntended !=  m3_kickoff$kickDirectionActual ~ "Inaccurate",
+              is.na(m3_kickoff$kickDirectionActual) ~ "Missing")
+
+#Accuracy Proportion
+accuracy_prop = sum(m3_kickoff$kickoff_accuracy == "Accurate") / sum(m3_kickoff$kickoff_accuracy != "Missing")
+
+ggplot(filter(m3_kickoff, kickoff_accuracy != "Missing"), aes(x = kickReturnYardage)) +
+  geom_density(aes(fill  = kickoff_accuracy), col = "black", alpha = 0.2) +
+  labs(title = "Distribution of Kickoff Returns", subtitle = "Colored by Accuracy", x = "Return Distance (Yards)", 
+       y = "Density", fill = "Kickoff Accuracy")
+```
+
+Kickoff accuracy is important for the coverage team's coordination. However, it does not appear to have any notable differences in return distances for the receiving team. Also given that over 99% of kickoffs are accurate, accuracy is not a particularly meaningful variable that should be considered for our evaluation model.
+
+```{r, message=F, warning=F, fig.cap = "Figure 4: Scatterplot of kickoff distance against return distance colored by hang time."}
+#hang time vs return yardage
+#filter out onsides and maybe remove geom_smooth if it isn't informative
+
+#top 3 non-onside kickoff types
+df_kickoff_no_onside = filter(m3_kickoff, kickType_mod == "Deep" | kickType_mod == "Flat" | kickType_mod == "Pooch Kick")
+
+p = ggplot(df_kickoff_no_onside, aes(y = kickLength, x = kickReturnYardage, col = hangTime)) +
+  geom_point() +
+  scale_color_gradient(low = "blue", high = "pink") +
+  geom_smooth(formula = y ~ x, method = "loess", se = F) +
+  labs(title = "Kickoff Distance vs Return", subtitle = "Colored by Hang Time", x = "Return Distance (Yards)", 
+       y = "Kick Distance (Yards)", col = "Hang Time")
+
+suppressMessages(print(p))
+```
+
+While there is a positive relationship between kick distance and return distance, this does not mean teams are better off kicking short kickoffs. Farther kicks give returners more space to run but it also increases the kickoff's net yardage which is ultimately most important for the kicking team. Since increased hang time gives the coverage team more time to travel downfield, our evaluation model for kickoffs should include net yardage and hang time.
+
+```{r, warning=F, include=F}
+#Kickoff EDA
+
+p1 = ggplot(df_kickoff_no_onside, aes(x = hangTime)) +
+  geom_density(aes(fill = kickType_mod), col = "steelblue", alpha = 0.2) +
+  labs(title = "Distribution of Kickoff Hang Time", subtitle = "Colored by Kick Type", x = "Hang Time (Seconds)", 
+       y = "Density", fill = "Kick Type")
+
+p2 = ggplot(df_kickoff_no_onside, aes(x = kickLength)) +
+  geom_density(aes(fill = kickType_mod), col = "steelblue", alpha = 0.2) +
+  labs(title = "Distribution of Kickoff Distance", subtitle = "Colored by Kick Type", x = "Distance (Yards)", 
+       y = "Density", fill = "Kick Type")
+
+p3 = ggplot(df_kickoff_no_onside, aes(x = kickReturnYardage)) +
+  geom_density(aes(fill = kickType_mod), col = "steelblue", alpha = 0.2) +
+  labs(title = "Distribution of Kickoff Return", subtitle = "Colored by Kick Type", x = "Return Distance (Yards)", 
+       y = "Density", fill = "Kick Type")
+```
+
+
+```{r, warning=F, fig.cap = "Figure 5: Bar chart of onside kick strategies grouped by results"}
+df_onside = filter(m3_kickoff, kickType_mod == "Suprise Onside" | kickType_mod == "Obvious Onside")
+
+p4 = ggplot(df_onside, aes(x = kickLength)) +
+  geom_density(aes(fill = kickType_mod), col = "steelblue", alpha = 0.2) +
+  labs(title = "Distribution of Onside Kick Distance", subtitle = "Colored by Onside Kick Type", x = "Distance (Yards)", 
+       y = "Density", fill = "Kick Type")
+
+p5 = ggplot(df_onside, aes(kickType_mod, ..count..)) + 
+  geom_bar(aes(fill = specialTeamsResult_mod), position = "dodge", col = "Black") +
+  scale_fill_brewer(palette="Blues") +
+  labs(title = "Onside Kick Results", fill = "Results", x = "Onside Kick Type", y = "Frequency")
+
+p5
+```
+
+In the NFL, teams kick onside kicks often as a last-ditch effort to regain possession of the ball after they score when they are trailing and there is little time remaining. Between the 2018 and 2020 seasons, approximately 9% of onside kicks were successfully recovered by the kicking team. Proportionately, there is no significant difference in the outcome of onside kicks (particularly recovery) regardless of whether they are obvious or a surprise. Therefore, one onside strategy does not stand out as better.
+
+```{r, include=F}
+#Proportion of recovered onside kicks
+
+#Total Proportion
+df_onside %>% 
+  group_by(specialTeamsResult_mod) %>%
+  summarise(count = n()) %>%
+  mutate(proportion = round(count/nrow(df_onside), 4)) %>%
+  arrange(-proportion)
+
+#Obvious Onside
+df_obvious = df_onside %>% filter(kickType_mod == "Obvious Onside")
+
+df_obvious %>%
+  group_by(specialTeamsResult_mod) %>%
+  summarise(count = n()) %>%
+  mutate(proportion = round(count/nrow(df_obvious), 4)) %>%
+  arrange(-proportion)
+
+#Suprise Onside
+df_suprise = df_onside %>% filter(kickType_mod == "Suprise Onside")
+
+df_suprise %>%
+  group_by(specialTeamsResult_mod) %>%
+  summarise(count = n()) %>%
+  mutate(proportion = round(count/nrow(df_suprise), 4)) %>% 
+  arrange(-proportion)
+
+#Among onside kick types, there does not appear to be one that yield significantly different recovery results.
+```
+
+Although we performed EDA on onside kicks, they aren't an appropriate metric to rank special teams players because in a single season some kickers don't attempt any onside kicks, and even if they do it is not substantial  (e.g., more than 5 onside kicks) for most players.
+
+### Punt
+
+```{r, warning=F, fig.cap = "Figure 6: Scatterplot of punt and return distance colored by hang time."}
+ggplot(m3_punt, aes(y = kickLength, x = kickReturnYardage, col = hangTime)) +
+  geom_point() +
+  scale_color_gradient(low = "blue", high = "pink") +
+  labs(title = "Punt Distance vs Return", subtitle = "Colored by Hangtime", y = "Distance (Yards)", 
+       x = "Return Distance (Yards)", col = "Hang Time (Seconds)")
+```
+
+It appears that the punt distance is directly associated with hang time and also has a weakly positive association with the return distance. However, this does not mean punters should avoid kicking deep punts. It's highly probable that the fact that deep punts give returns more space to run is the factor motivating the weak positive relationship between punt and return distance.
+
+```{r, include=F}
+#operation/handling time density col by blocked or not
+
+m3_punt$specialTeamsResult_mod %>% table()
+```
+
+```{r, warning=F, fig.cap = "Figure 7: Probability density function of punt distance and hang time colored by snap detail."}
+pp1 = ggplot(m3_punt, aes(x = kickLength, col = snapDetail)) +
+  geom_density() +
+  labs(title = "Distribution of Punt Distance Across Snap Types", x = "Kick Length (Yards)", y = "Density", 
+       col = "Snap Detail", subtitle = "Colored by Snap Detail")
+
+pp2 = ggplot(m3_punt, aes(x = hangTime, col = snapDetail)) +
+  geom_density() +
+  labs(title = "Distribution of Punt Hang Time Across Snap Types", x = "Hang Time (Seconds)", y = "Density", 
+       col = "Snap Detail", subtitle = "Colored by Snap Detail")
+
+grid.arrange(pp1,pp2)
+```
+
+The optimal placement for a snap is near the hip on your kicking side (e.g., at my right hip if I am a right-footed punter). Low snaps and snaps to the right appear to be associated with relatively less punt distance. However, there appears to be no significant differences in hang times across snap detail.
+
+```{r, warning = F, fig.cap = "Figure 8: Probability density functions of the hang time and distance of nose down and normal punts."}
+#Punt EDA
+m3_punt_no_block = filter(m3_punt_main, kickType_mod != "Unknown")
+
+p6 = ggplot(m3_punt_no_block, aes(x = handlingTime)) +
+  geom_density(aes(fill = kickType_mod), col = "black", alpha = 0.2) +
+  labs(title = "Distribution of Punter Handling Time", subtitle = "Colored by Punt Type", x = "Handling Time (Seconds)", 
+       y = "Density", fill = "Punt Type")
+
+p7 = ggplot(m3_punt_no_block, aes(x = hangTime)) +
+  geom_density(aes(fill = kickType_mod), col = "black", alpha = 0.2) +
+  labs(title = "Distribution of Punt Hang Time", subtitle = "Colored by Punt Type", x = "Hang Time (Seconds)", 
+       y = "Density", fill = "Punt Type")
+
+p8 = ggplot(m3_punt_no_block, aes(x = kickLength)) +
+  geom_density(aes(fill = kickType_mod), col = "black", alpha = 0.2) +
+  labs(title = "Distribution of Punt Distance", subtitle = "Colored by Punt Type", x = "Distance (Yards)", 
+       y = "Density", fill = "Punt Type")
+
+grid.arrange(p7,p8)
+```
+
+Nose-down punts travel less distance and have less hang time, on average, compared to normal punts. Punters often use nose-down punts in short punt scenarios when they want to pin the ball within the 20yd line and the back spin of these punts helps prevent the ball from rolling into the end zone resulting in a touchback.
+
+### Field Goal
+
+```{r, fig.cap = "Figure 9: Probability density function of field goals across distances and grouped by accuracy."}
+#Field Goal EDA
+
+ggplot(filter(m3_fg, specialTeamsResult_mod == "Made" | specialTeamsResult_mod == "Missed"), aes(x = kickLength)) +
+  geom_density(aes(fill = specialTeamsResult_mod), col = "black", alpha = 0.2) +
+  labs(title = "Distribution of Field Goal Distance", subtitle = "Colored by Result", x = "Distance (Yards)", 
+       y = "Density", fill = "Result")
+```
+
+As the field goal distance increases, the proportion of made field goals decreases. Leg strength is less of an issue relative to hooking the kick and being more susceptible to wind.
+
+'Clutchness' is classified as the last five minutes of the first or second half while the score is within a field goal (i.e., difference in scores is $\leq 3$)
+
+```{r, fig.cap = "Figure 10: The proportion of field goals made in clutch time grouped by distance. There is a notable dropoff in field goal accuracy for 40-49yd and 50+yd field goals in clutch time."}
+position = c("20-29", "30-39", "40-49", ">50") #set order of bars
+
+ggplot(clutch_fg_df, aes(x = kick_dist, y = prop, fill = clutchness)) +
+  geom_col(col = "black", position="dodge") +
+  #geom_errorbar(aes(ymin = lower, ymax= upper), width = .2, position="dodge") + #CI non-informative bc clutch n small so bounds are large
+  scale_x_discrete(limits = position) +
+  coord_cartesian(ylim = c(0.5, 1)) +
+  theme(axis.ticks.x  = element_blank()) + #remove tick marks on x axis
+  labs(title = "Field Goals in Clutch Time", x = "Kick Distance (Yards)", y = "Proportion Made", fill = "Clutch Time")
+```
+
+The pressure of performing in clutch time situations can create an added burden on kickers. From this bar chart, we can see that as the kick distance increases the gap between conversion rates for kicks widens in clutch vs non-clutch time. This observation is especially prominent in 40-49yd and 50+yd field goals where we see conversion rates drop off noticeably in clutch time. Therefore, we should consider clutch time performance in our player ranking model for field goal kickers.
+
+```{r, include=F}
+#punt clutch: keep for date_labels reference
+ggplot(filter(m3_punt, time_clutch == 1), aes(x = gameClock_time, y = kickLength)) +
+  geom_point() +
+  scale_x_datetime(date_labels = "%M:%S") + #only valid w POSIXct class
+  labs(x = "Time (Minutes:Seconds)", y = "Kick Distance (Yards)", title = "Punts In Clutch Time")
+
+ggplot(filter(m3_punt, time_clutch == 0), aes(x = gameClock_time, y = kickLength)) +
+  geom_point() +
+  scale_x_datetime(date_labels = "%M:%S") + #only valid w POSIXct class
+  labs(x = "Time (Minutes:Seconds)", y = "Kick Distance (Yards)", title = "Punts Not In Clutch Time")
+```
+
+## Punter/Kicker Rating: PKR
+
+Drawing inspiration from Total Quarterback Rating (QBR) we are developing a ranking system for punters and kickers. 
+
+For punters, this system takes into account net yards, hang time, inside 20 proportion, and blocked punts.
+
+For field goal kickers, this system takes into account their field goal distance, accuracy, and performance in clutch time. 
+
+For kickoffs, this ranking system takes into account net yards, hang time, and whether the kickoff went out of bounds.
+
+### Model
+
+```{r, include=F}
+# Suppress summarise info
+options(dplyr.summarise.inform = FALSE)
+
+#minimum 20 snaps per year
+#In these code chunks, we are designing the data frame for each play type to go into the evaluation function
+
+temp_punt = m3_punt %>%
+  group_by(displayName,season) %>%
+  summarise(net_yards = mean(playResult),
+            hang_time = mean(hangTime, na.rm = T),
+            in20prop = sum(inside_20)/n(),
+            block = sum(block)/n(),
+            snaps = n()) %>%
+  filter(snaps >= 20) %>%
+  arrange(season, -net_yards)
+```
+
+```{r, include=F}
+#field goal/xp rankings
+#blocked kicks are read in and discarded as NAs. No way to tell if it is kickers fault or if blockers. With punts we can use handling time as a indicator
+
+#NaNs set as z-score = 0, so the player is not helped nor penalized by not having any attempts at that statistic
+
+temp_xp = m3_xp %>%
+  group_by(displayName, season) %>%
+  summarise(snaps = n(),
+            xp_prop = sum(good)/snaps) %>%
+  filter(snaps >= 15) %>%
+  arrange(season, -xp_prop)
+
+rem_non_one = function(x){ifelse(x != 1, 0, x)} #avoid summation of -1
+
+temp_fg = m3_fg %>%
+  group_by(displayName, season) %>%
+  summarise(snaps = n(),
+            
+            #Overall Accuracy (Just reference, in algo its captured in dist props)
+            accuracy = round(sum(specialTeamsResult_mod == "Made")/snaps,5),
+            
+            #attempts
+            less_30 = sum(abs(good_less30), na.rm = T),
+            f_30_t_40 = sum(abs(good_30to40), na.rm = T),
+            f_40_t_50 = sum(abs(good_40to50), na.rm = T),
+            above_50 = sum(abs(good_above50), na.rm = T),
+            
+            #proportions
+            prop_30 = sum(rem_non_one(good_less30), na.rm = T)/less_30,
+            prop_30_40 = sum(rem_non_one(good_30to40), na.rm = T)/f_30_t_40,
+            prop_40_50 = sum(rem_non_one(good_40to50), na.rm = T)/f_40_t_50,
+            prop_50 = sum(rem_non_one(good_above50), na.rm = T)/above_50,
+            
+            #Clutch
+            prop_clutch = sum(good_clutch == 1, na.rm = T)/(sum(good_clutch == 1, na.rm = T) + sum(good_clutch == -1, na.rm = T))) %>%
+  filter(snaps >= 15) %>%
+  arrange(season)
+
+#fix NaN for prop_clutch --> z-score = 0 at mean
+temp_fg$prop_clutch[is.na(temp_fg$prop_clutch)] = mean(temp_fg$prop_clutch, na.rm = T)
+
+#fix NaN for prop_50
+temp_fg$prop_50[is.na(temp_fg$prop_50)] = mean(temp_fg$prop_50, na.rm = T)
+
+#right join to fg rank by displayname and season
+temp_fg_xp = merge(temp_fg, 
+      temp_xp %>% dplyr::select(-snaps),
+      by = c("displayName", "season")) %>%
+  arrange(season, -accuracy)
+```
+
+```{r, include=F}
+#kickoff rankings (no oob penalization, equal weighting)
+temp_kickoff = df_kickoff_no_onside %>%
+  group_by(displayName, season) %>%
+  summarise(net_yards = mean(playResult),
+            hang_time = mean(hangTime, na.rm = T),
+            oob = mean(oob),
+            snaps = n()) %>%
+  filter(snaps >= 30) %>%
+  arrange(season, -net_yards)
+```
+
+Our model applies weights to the standardized statistics to evaluate special teams players by play type (e.g., punt, field goal, kickoff).
+
+By evaluating players on their statistics standardized by their position group's performance, in a respective season, we can get a direct measure of how performances stack up against the field.
+
+Given that some special team's statistics are more important than others (e.g., net yards are more important than hang time for punts and kickoffs), we've applied weights to the standardized z-scores of each statistic.
+
+The following are the model's specifications:
+
+$standardization \space  is \space denoted  \space as  \space z  \space such  \space that:  \space z = \frac{x_i-\mu}{\sigma}$
+
+$weights \space are \space denoted \space as \space \beta \space terms \space such \space that: -1\leq\beta\leq1$
+
+$punter \space rating = \beta_{p1} z(net \space yards) + \beta_{p2} z(hang \space time) + \beta_{p3} z(inside \space the \space 20\%) + \beta_{p4} z(blocked\%)$
+
+$fg/xp \space rating = \beta_{f1} z(xp\%) + \beta_{f2}z(20-29\%) + \beta_{f3}z(30-39\%) + \beta_{f4}z(40-49\%) + \beta_{f5}z(\geq50\%) + \beta_{f6}z(clutch \space time\%)$
+
+$kickoff \space rating = \beta_{k1}z(net \space yards) + \beta_{k2}z(hang \space time) + \beta_{k3}z(out \space of \space bounds\%)$
+
+Tables 1-3 display the top 3 PKR rankings per season for punts, field goals, and kickoffs.
+
+```{r,include=F}
+#NFL teams value clutch performance more than they do during other points in the game.
+#unsupervised weights using ml methods
+
+```
+
+```{r}
+#weighted rank function
+
+weighted_rank = function(temp, a, b, weights){
+  
+  temp_2018 = filter(temp, season == "2018")
+  temp_2019 = filter(temp, season == "2019")
+  temp_2020 = filter(temp, season == "2020")
+
+norm_sum_func = function(df, a, b, weights){
+  norm = apply(df[,a:b], 2, scale)
+  weights = weights
+
+  #weights*norm
+  hold = NULL
+  for(i in 1:ncol(norm)){
+    new_col = weights[i] * norm[,i]
+    hold = cbind(hold, new_col)
+  }
+  
+  sum = apply(hold, 1, sum) %>% round(.,5)
+  cbind(df, PKR = sum) %>% arrange(-PKR)
+  }
+
+  x_18 = norm_sum_func(temp_2018, a, b, weights)
+  x_19 = norm_sum_func(temp_2019, a, b, weights)
+  x_20 = norm_sum_func(temp_2020, a, b, weights)
+  
+  rbind(x_18, x_19, x_20)
+}
+```
+
+```{r}
+#Punt rankings (weighted, with block penalty)
+
+#create function that rounds to 4 and has a display_stats option
+punt_weights = c(1, 0.25, 0.5, -0.2)
+
+punt_pkr = weighted_rank(temp = temp_punt, a = 3, b = 6, punt_weights)
+
+colnames(punt_pkr) = c("Name", "Season", "Net Yards", "Hang Time", "In20Prop", "Blocks (%)", "Attempts", "PKR")
+
+punt_pkr = punt_pkr %>% relocate(Attempts, .after = Season)
+
+display_pkr = function(df, show_stats = T){
+
+  round_2_dec = function(x){
+    #round to two decimal places
+    format(round(x, 2), nsmall = 2) %>% as.numeric()
+  }
+  
+  df[,3:ncol(df)] = apply(df[,3:ncol(df)], 2, round_2_dec)
+  
+  
+  if(show_stats == F){df[,c(1,2,ncol(df))]}
+  else(df)
+  
+}
+
+punt_pkr_fin = display_pkr(punt_pkr, show_stats = T)
+
+tab_punt = punt_pkr_fin %>% group_by(Season) %>% slice(1:3)
+
+tab_punt[,-2] %>% 
+  kbl(caption = "Table 1: Top 3 Punters Per Season", booktabs = T) %>% 
+  kable_paper("hover", full_width = T) %>%
+  pack_rows(index = c("2018" = 3, "2019" = 3, "2020" = 3))
+```
+
+```{r}
+#field goal/xp weighted ranking
+
+fg_weights =  c(0.6, 0.7, 0.8, 1, 0.6, 0.5)
+
+fg_pkr = weighted_rank(temp = temp_fg_xp, a = 9, b = 14, fg_weights)
+
+colnames(fg_pkr) = c("Name", "Season", "Attempts", "FG Accuracy", "20-29", "30-39", "40-49", ">50", "20-29 (%)", "30-39 (%)", "40-49 (%)", ">50 (%)", "Clutch (%)","XP Accuracy","PKR")
+
+fg_pkr = fg_pkr[,-c(5:8)]
+
+fg_pkr_fin = display_pkr(fg_pkr, show_stats = T)
+
+tab_fg = fg_pkr_fin %>% group_by(Season) %>% slice(1:3)
+
+tab_fg[,-2] %>% 
+  kbl(caption = "Table 2: Top 3 Field Goal Kickers Per Season", booktabs = T) %>% 
+  kable_paper("hover", full_width = T) %>%
+  pack_rows(index = c("2018" = 3, "2019" = 3, "2020" = 3))
+```
+
+```{r}
+#Kickoff weighted ranking (with oob penalty)
+
+kickoff_weights = c(1, 0.25, -0.2)
+
+kickoff_pkr = weighted_rank(temp = temp_kickoff, a = 3, b = 5, kickoff_weights)
+
+colnames(kickoff_pkr)  = c("Name", "Season", "Net Yards", "Hang Time", "Out of Bounds (%)","Attempts", "PKR")
+
+kickoff_pkr = kickoff_pkr %>% relocate(Attempts, .after = Season)
+
+kickoff_pkr_fin = display_pkr(kickoff_pkr, show_stats = T)
+
+tab_kickoff = kickoff_pkr_fin %>% group_by(Season) %>% slice(1:3)
+
+tab_kickoff[,-2] %>% 
+  kbl(caption = "Table 3: Top 3 Kickoff Kickers Per Season", booktabs = T) %>% 
+  kable_paper("hover", full_width = T) %>%
+  pack_rows(index = c("2018" = 3, "2019" = 3, "2020" = 3))
+```
+
+### Limitations
+
+1. **No Comparison Across Seasons**: PKR scores are dependent on the position group's aggregate performance on a yearly basis, so it is possible that players with a PKR score of 3 in 2018 have better or worse statistics (e.g., net yards, hang time) than a player with the same PKR score in 2019. Therefore, by the virtue of standardizing the evaluation criteria by year, meaningful comparisons among players can not be made across seasons using the PKR. 
+
+2. **Inconsistent PKR Across Positions**: On average, field goal kickers will have a higher PKR score than punters because more criteria go into the evaluation score of kickers. Therefore, performance comparisons should only be made within position groups (e.g., comparing kickers with kickers and punters with punters).
+
+3. **Arbitrary Weights**: Given that this data is unlabeled (i.e., plays are not labeled as 'good' or 'bad') and yardage from special teams plays are not significantly associated with any factors outside the punter and/or kicker's leg strength, we were restricted from using supervised models to calculate PKR weights. We considered using an unsupervised neural network to calculate weights for our standardized statistics but this was not practical given the data and our problem statement. In turn, we utilize arbitrary weights that roughly capture the value of each statistic going into the PKR.
