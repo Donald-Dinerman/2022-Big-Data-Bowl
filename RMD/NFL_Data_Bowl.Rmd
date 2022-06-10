@@ -48,10 +48,10 @@ library(kableExtra) #kable()
 
 ```{r}
 #Read Data
-games_df = read.csv("games.csv")
-players_df = read.csv("players.csv")
-plays_df = read.csv("plays.csv")
-scouting_df = read.csv("PFFScoutingData.csv")
+games_df = read.csv("C:/Undergraduate/R/2022-Big-Data-Bowl/Data/games.csv")
+players_df = read.csv("C:/Undergraduate/R/2022-Big-Data-Bowl/Data/players.csv")
+plays_df = read.csv("C:/Undergraduate/R/2022-Big-Data-Bowl/Data/plays.csv")
+scouting_df = read.csv("C:/Undergraduate/R/2022-Big-Data-Bowl/Data/PFFScoutingData.csv")
 ```
 
 ```{r, include=F}
